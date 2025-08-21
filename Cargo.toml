@@ -22,6 +22,9 @@ hyper = { version = "1.6.0", features = ["full"] }
 http-body-util = "0.1.2"
 hyper-util = { version = "0.1.10", features = ["full"] }
 log = "0.4.22"
+# Added for mDNS discovery and advertising
+mdns-sd = "0.10.0"
+async-trait = "0.1.80"
 
 [dev-dependencies]
 rosc = "0.10.1"

@@ -1,12 +1,10 @@
 #[tokio::main]
 async fn main() {
-    std::env::set_var("RUST_LOG", "debug");
+    //std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
 
     // Start looking for VRChat's OSC & OSCQuery services.
-    oyasumivr_oscquery::client::init(
-        "./lib/mdns-sidecar.exe", // The (relative) path to the mdns-sidecar.exe executable
-    )
+    oyasumivr_oscquery::client::init() // The (relative) path to the mdns-sidecar.exe executable)
     .await
     .unwrap();
 

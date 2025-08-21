@@ -2,6 +2,8 @@ use std::collections::HashMap as Map;
 
 use serde::{Deserialize, Serialize};
 
+// This enum is only used for the internal OSCMethod definition,
+// distinct from the mDNS service types handled by the `mdns` module.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum OSCServiceType {
     OSC,
@@ -70,7 +72,7 @@ pub enum OSCQueryInitError {
     AlreadyInitialized,
     NotYetInitialized,
     OSCQueryServiceInitFailed,
-    MDNSExecutableNotFound,
+    // MDNSExecutableNotFound, // Removed as sidecar is no longer external executable
     MDNSInitFailed,
 }
 
@@ -88,4 +90,10 @@ pub struct OSCQueryHostInfo {
 pub enum Error {
     IO(std::io::Error),
     InitError(OSCQueryInitError),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::IO(err)
+    }
 }

@@ -21,16 +21,14 @@ use tokio::sync::Mutex;
 static INITIALIZED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static MDNS_SERVICE_NAME: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::default());
 static OSC_METHODS: LazyLock<Mutex<Vec<OSCMethod>>> = LazyLock::new(|| Mutex::new(vec![]));
-static OSCQUERY_ROOT_NODE: LazyLock<Mutex<Option<OSCQueryNode>>> = LazyLock::new(|| Mutex::default());
+static OSCQUERY_ROOT_NODE: LazyLock<Mutex<Option<OSCQueryNode>>> =
+    LazyLock::new(|| Mutex::default());
 static OSC_PORT: LazyLock<Mutex<Option<u16>>> = LazyLock::new(|| Mutex::default());
 static OSCQUERY_PORT: LazyLock<Mutex<Option<u16>>> = LazyLock::new(|| Mutex::default());
-static OSCQUERY_SHUTDOWN_SENDER: LazyLock<Mutex<Option<Sender<bool>>>> = LazyLock::new(|| Mutex::default());
+static OSCQUERY_SHUTDOWN_SENDER: LazyLock<Mutex<Option<Sender<bool>>>> =
+    LazyLock::new(|| Mutex::default());
 
-pub async fn init(
-    service_name: &str,
-    osc_port: u16,
-    mdns_sidecar_path: &str,
-) -> Result<(String, u16), Error> {
+pub async fn init(service_name: &str, osc_port: u16) -> Result<(String, u16), Error> {
     // Ensure single initialization
     {
         let mut initialized = INITIALIZED.lock().await;
@@ -49,12 +47,7 @@ pub async fn init(
         let mut osc_port_ref = OSC_PORT.lock().await;
         *osc_port_ref = Some(osc_port);
     }
-    // Set the MDNS sidecar executable path
-    if let Err(e) = crate::mdns_sidecar::set_exe_path(mdns_sidecar_path.to_string()).await {
-        error!("Could not set the MDNS sidecar executable path: {:#?}", e);
-        *INITIALIZED.lock().await = false;
-        return Err(Error::InitError(e));
-    }
+
     // Initialize the OSCQuery service
     let (oscquery_host, oscquery_port, oscquery_shutdown_sender) =
         match start_oscquery_service().await {
@@ -78,6 +71,20 @@ pub async fn init(
         let mut oscquery_shutdown_sender_ref = OSCQUERY_SHUTDOWN_SENDER.lock().await;
         *oscquery_shutdown_sender_ref = Some(oscquery_shutdown_sender);
     }
+
+    // Mark server started in mdns_sidecar to advertise the service
+    if let Err(e) = crate::mdns_sidecar::mark_server_started(
+        osc_port,
+        oscquery_port,
+        service_name.to_string(),
+    )
+    .await
+    {
+        error!("Could not start MDNS advertisements for server: {:#?}", e);
+        *INITIALIZED.lock().await = false;
+        return Err(Error::InitError(OSCQueryInitError::MDNSInitFailed));
+    }
+
     Ok((oscquery_host, oscquery_port))
 }
 
@@ -89,9 +96,9 @@ pub async fn deinit() -> Result<(), Error> {
             return Err(Error::InitError(OSCQueryInitError::NotYetInitialized));
         }
     }
-    // Stop the MDNS sidecar
+    // Stop the MDNS sidecar advertisements
     if let Err(e) = crate::mdns_sidecar::mark_server_stopped().await {
-        error!("Could not stop the MDNS Sidecar: {:#?}", e);
+        error!("Could not stop the MDNS Sidecar advertisements: {:#?}", e);
         return Err(Error::InitError(OSCQueryInitError::MDNSInitFailed));
     }
     // Stop the OSC Query server
@@ -269,9 +276,21 @@ async fn update_oscquery_root_node() {
                     OSCMethodValueType::Bool => {
                         current_node.value = vec![serde_json::Value::Bool(value == "true")];
                     }
-                    OSCMethodValueType::Int | OSCMethodValueType::Float => {
-                        current_node.value =
-                            vec![serde_json::Value::Number(value.parse().unwrap())];
+                    OSCMethodValueType::Int => {
+                        if let Ok(num) = value.parse::<i64>() {
+                            current_node.value = vec![serde_json::Value::Number(num.into())];
+                        } else {
+                            error!("Failed to parse int value: {}", value);
+                        }
+                    }
+                    OSCMethodValueType::Float => {
+                        if let Ok(num) = value.parse::<f64>() {
+                            current_node.value = vec![serde_json::Value::Number(
+                                serde_json::Number::from_f64(num).unwrap(),
+                            )];
+                        } else {
+                            error!("Failed to parse float value: {}", value);
+                        }
                     }
                     OSCMethodValueType::String => {
                         current_node.value = vec![serde_json::Value::String(value)];
@@ -307,13 +326,13 @@ async fn start_oscquery_service() -> Result<(String, u16, Sender<bool>), Error> 
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _)) => {
-                            let mut shutdown_receiver = shutdown_receiver.clone();
+                            let mut shutdown_receiver_clone = shutdown_receiver.clone();
                             tokio::task::spawn(async move {
                                 let io = TokioIo::new(stream);
                                 tokio::select! {
                                     _ = http1::Builder::new().serve_connection(io, service_fn(handle_oscquery_request)) => {}
                                     // Shutdown signal received
-                                    _ = shutdown_receiver.changed() => {}
+                                    _ = shutdown_receiver_clone.changed() => {}
                                 }
                             });
                         }
@@ -337,29 +356,25 @@ async fn handle_oscquery_request(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Get path from request
     let path = req.uri().path().to_string();
-    let json = get_json_for_osc_address(path.clone()).await;
     // Get query parameters from request
     let query = req.uri().query();
-    if let Some(query) = query {
-        match query {
-            "HOST_INFO" => {
-                let mut response =
-                    Response::new(Full::new(Bytes::from(get_host_info_json().await)));
-                let headers = response.headers_mut();
-                headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
-                headers.insert("Content-Type", "application/json".parse().unwrap());
-                return Ok(response);
-            }
-            _ => {
-                let mut response = Response::new(Full::new(Bytes::from("Unknown Attribute")));
-                *response.status_mut() = hyper::StatusCode::NO_CONTENT;
-                return Ok(response);
-            }
+
+    if let Some(query_str) = query {
+        if query_str == "HOST_INFO" {
+            let mut response = Response::new(Full::new(Bytes::from(get_host_info_json().await)));
+            let headers = response.headers_mut();
+            headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+            headers.insert("Content-Type", "application/json".parse().unwrap());
+            return Ok(response);
         }
     }
+
+    // Default to JSON response for path if not HOST_INFO
+    let json = get_json_for_osc_address(path.clone()).await;
+
     match json {
-        Some(json) => {
-            let mut response = Response::new(Full::new(Bytes::from(json)));
+        Some(json_string) => {
+            let mut response = Response::new(Full::new(Bytes::from(json_string)));
             let headers = response.headers_mut();
             headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
             headers.insert("Content-Type", "application/json".parse().unwrap());
@@ -367,7 +382,7 @@ async fn handle_oscquery_request(
         }
         None => {
             let mut response = Response::new(Full::new(Bytes::from("No Content")));
-            *response.status_mut() = hyper::StatusCode::NO_CONTENT;
+            *response.status_mut() = hyper::StatusCode::NOT_FOUND; // Changed to NOT_FOUND
             Ok(response)
         }
     }

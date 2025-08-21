@@ -1,34 +1,172 @@
+use crate::mdns::{IDiscovery, MeaModDiscovery, OSCQueryServiceProfile, OSCServiceType};
+use crate::{ OSCQueryInitError};
 use log::{debug, error};
-use std::process::{self, Stdio};
 use std::sync::LazyLock;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
-use crate::OSCQueryInitError;
+// Channels for passing discovered VRChat addresses to the client module
+// These are managed internally by mdns_sidecar
+static VRC_OSC_ADDR_TX: LazyLock<Mutex<Option<Sender<(String, u16)>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static VRC_OSC_ADDR_RX: LazyLock<Mutex<Option<Receiver<(String, u16)>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static VRC_OSCQUERY_ADDR_TX: LazyLock<Mutex<Option<Sender<(String, u16)>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static VRC_OSCQUERY_ADDR_RX: LazyLock<Mutex<Option<Receiver<(String, u16)>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-// const CREATE_NO_WINDOW: u32 = 0x08000000;
-const DETACHED_PROCESS: u32 = 0x00000008;
+static MDNS_DISCOVERY_INSTANCE: LazyLock<Mutex<Option<Box<dyn IDiscovery>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static MDNS_MONITOR_TASK: LazyLock<Mutex<Option<JoinHandle<()>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static SERVER_ADVERTISEMENT_PROFILE: LazyLock<Mutex<Option<OSCQueryServiceProfile>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-static SIDECAR_STARTED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
-static KILL_TX: LazyLock<Mutex<Option<tokio::sync::mpsc::Sender<()>>>> = LazyLock::new(|| Mutex::new(None));
-static OSC_PORT: LazyLock<Mutex<Option<u16>>> = LazyLock::new(|| Mutex::new(None));
-static OSCQUERY_PORT: LazyLock<Mutex<Option<u16>>> = LazyLock::new(|| Mutex::new(None));
-static SERVICE_NAME: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 static CLIENT_ENABLED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static SERVER_ENABLED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
-static EXE_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
-pub async fn set_exe_path(path_str: String) -> Result<(), OSCQueryInitError> {
-    // Verify if there's an executable file at the path
-    let path = std::path::Path::new(&path_str);
-    if !path.exists() || !path.is_file() {
-        return Err(OSCQueryInitError::MDNSExecutableNotFound);
-    }
+pub async fn init_client_channels(
+) -> Result<(Receiver<(String, u16)>, Receiver<(String, u16)>), OSCQueryInitError> {
+    debug!("Initializing the MDNS sidecar client channels...");
+    // Only initialize once
     {
-        *EXE_PATH.lock().await = Some(path_str.clone());
+        let mut discovery_guard = MDNS_DISCOVERY_INSTANCE.lock().await;
+        if discovery_guard.is_some() {
+            debug!("MDNS discovery instance already exists. Returning existing receivers.");
+            let osc_rx = VRC_OSC_ADDR_RX
+                .lock()
+                .await
+                .take()
+                .ok_or(OSCQueryInitError::MDNSInitFailed)?;
+            let oscquery_rx = VRC_OSCQUERY_ADDR_RX
+                .lock()
+                .await
+                .take()
+                .ok_or(OSCQueryInitError::MDNSInitFailed)?;
+            return Ok((osc_rx, oscquery_rx));
+        }
+
+        // Channels for mDNS service events (internal to MeaModDiscovery)
+        let (osc_service_added_tx, mut osc_service_added_rx) = channel(10);
+        let (osc_query_service_added_tx, mut osc_query_service_added_rx) = channel(10);
+        let (osc_service_removed_tx, mut osc_service_removed_rx) = channel(10);
+        let (osc_query_service_removed_tx, mut osc_query_service_removed_rx) = channel(10);
+
+        // Create the mDNS discovery instance
+        let discovery = MeaModDiscovery::new(
+            osc_service_added_tx,
+            osc_query_service_added_tx,
+            osc_service_removed_tx,
+            osc_query_service_removed_tx,
+        );
+        *discovery_guard = Some(Box::new(discovery));
+
+        // Create the channels for client.rs and store the Sender halves internally
+        {
+            let (vrc_osc_tx, vrc_osc_rx) = channel(100);
+            let (vrc_oscquery_tx, vrc_oscquery_rx) = channel(100);
+
+            *VRC_OSC_ADDR_TX.lock().await = Some(vrc_osc_tx);
+            *VRC_OSC_ADDR_RX.lock().await = Some(vrc_osc_rx); // Store RX for future calls to get_vrc_discovery_channels
+            *VRC_OSCQUERY_ADDR_TX.lock().await = Some(vrc_oscquery_tx);
+            *VRC_OSCQUERY_ADDR_RX.lock().await = Some(vrc_oscquery_rx); // Store RX for future calls to get_vrc_discovery_channels
+        }
+
+        // Start a task to monitor mDNS events and pass relevant ones to client
+        let monitor_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(profile) = osc_service_added_rx.recv() => {
+                        if profile.name.starts_with("VRChat-Client-") {
+                            debug!("VRChat OSC Service Found: {}:{}", profile.address, profile.port);
+                            // Get the sender from the LazyLock to send the event
+                            if let Some(tx) = VRC_OSC_ADDR_TX.lock().await.as_ref() {
+                                if let Err(e) = tx.send((profile.address.to_string(), profile.port)).await {
+                                    error!("Failed to send VRC_OSC_ADDR_DISCOVERY: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                    Some(profile) = osc_query_service_added_rx.recv() => {
+                        if profile.name.starts_with("VRChat-Client-") {
+                            debug!("VRChat OSCQuery Service Found: {}:{}", profile.address, profile.port);
+                            // Get the sender from the LazyLock to send the event
+                            if let Some(tx) = VRC_OSCQUERY_ADDR_TX.lock().await.as_ref() {
+                                if let Err(e) = tx.send((profile.address.to_string(), profile.port)).await {
+                                    error!("Failed to send VRC_OSCQUERY_ADDR_DISCOVERY: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                    Some(name) = osc_service_removed_rx.recv() => {
+                        if name.starts_with("VRChat-Client-") {
+                            debug!("VRChat OSC Service Removed: {}", name);
+                            // In a real scenario, you might want to clear the address in `client.rs`
+                            // For simplicity, we'll just log here. Clearing means `None` for client.
+                            // However, mDNS clients often hold the last known address until a new one is found.
+                        }
+                    }
+                    Some(name) = osc_query_service_removed_rx.recv() => {
+                        if name.starts_with("VRChat-Client-") {
+                            debug!("VRChat OSCQuery Service Removed: {}", name);
+                            // Same as above for removal
+                        }
+                    }
+                    else => {
+                        debug!("mDNS monitor task exiting.");
+                        break;
+                    }
+                }
+            }
+        });
+        *MDNS_MONITOR_TASK.lock().await = Some(monitor_task);
+        // Refresh services immediately after starting
+        /* if let Some(discovery) = discovery_guard.as_ref() {
+            discovery.refresh_services().await;
+        } */
+        // Return the Receiver halves
+        let osc_rx = VRC_OSC_ADDR_RX
+            .lock()
+            .await
+            .take()
+            .ok_or(OSCQueryInitError::MDNSInitFailed)?;
+        let oscquery_rx = VRC_OSCQUERY_ADDR_RX
+            .lock()
+            .await
+            .take()
+            .ok_or(OSCQueryInitError::MDNSInitFailed)?;
+        Ok((osc_rx, oscquery_rx))
     }
-    Ok(())
+}
+
+pub async fn deinit() {
+    {
+        // Stop the monitor task
+        if let Some(task) = MDNS_MONITOR_TASK.lock().await.take() {
+            task.abort();
+        }
+        // Unregister any advertised services
+        if let Some(discovery) = MDNS_DISCOVERY_INSTANCE.lock().await.as_ref() {
+            if let Some(profile) = SERVER_ADVERTISEMENT_PROFILE.lock().await.take() {
+                if let Err(e) = discovery.unadvertise(profile).await {
+                    error!(
+                        "Failed to unadvertise server service during deinit: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+        // Clear the discovery instance
+        *MDNS_DISCOVERY_INSTANCE.lock().await = None;
+        // Clear the internal channels
+        *VRC_OSC_ADDR_TX.lock().await = None;
+        *VRC_OSC_ADDR_RX.lock().await = None;
+        *VRC_OSCQUERY_ADDR_TX.lock().await = None;
+        *VRC_OSCQUERY_ADDR_RX.lock().await = None;
+    }
+    debug!("mDNS sidecar deinitialized.");
 }
 
 pub async fn mark_server_started(
@@ -36,43 +174,89 @@ pub async fn mark_server_started(
     oscquery_port: u16,
     service_name: String,
 ) -> Result<(), String> {
+    // Ensure the underlying mDNS discovery instance is initialized.
+    // This assumes `init_client_channels` (or a similar initial setup) has been called.
     {
-        let mut osc_port_guard = OSC_PORT.lock().await;
-        *osc_port_guard = Some(osc_port);
+        let discovery_guard = MDNS_DISCOVERY_INSTANCE.lock().await;
+        if discovery_guard.is_none() {
+            // If not initialized, ensure client channels are set up first,
+            // as this will also initialize the MDNS_DISCOVERY_INSTANCE.
+            // This is a common pattern where server and client might both rely on the same mDNS daemon.
+            // However, for server functionality only, you might want a separate init_server_discovery.
+            // For now, we'll try to get channels, which initializes if not present.
+            // Note: This 'init_client_channels' is a bit misnamed if it's also responsible for core MDNS daemon init.
+            drop(discovery_guard); // Release lock before calling async fn
+            if let Err(e) = init_client_channels().await {
+                return Err(format!(
+                    "mDNS discovery instance not initialized and failed to init: {:?}",
+                    e
+                ));
+            }
+        }
     }
-    {
-        let mut oscquery_port_guard = OSCQUERY_PORT.lock().await;
-        *oscquery_port_guard = Some(oscquery_port);
-    }
-    {
-        let mut service_name_guard = SERVICE_NAME.lock().await;
-        *service_name_guard = Some(service_name);
-    }
+
+    // Store the server advertisement profile
+    let osc_profile = OSCQueryServiceProfile::new(
+        service_name.clone(),
+        "127.0.0.1".parse().unwrap(), // Or actual local IP if needed
+        osc_port,
+        OSCServiceType::OSC,
+    );
+    let oscquery_profile = OSCQueryServiceProfile::new(
+        service_name.clone(),
+        "127.0.0.1".parse().unwrap(), // Or actual local IP if needed
+        oscquery_port,
+        OSCServiceType::OSCQuery,
+    );
+
     {
         let mut server_enabled = SERVER_ENABLED.lock().await;
         *server_enabled = true;
     }
-    reevaluate_sidecar_state().await
+
+    if let Some(discovery) = MDNS_DISCOVERY_INSTANCE.lock().await.as_ref() {
+        if let Err(e) = discovery.advertise(osc_profile.clone()).await {
+            return Err(e);
+        }
+        if let Err(e) = discovery.advertise(oscquery_profile.clone()).await {
+            // Try to unadvertise the first one if the second fails
+            let _ = discovery.unadvertise(osc_profile).await;
+            return Err(e);
+        }
+        *SERVER_ADVERTISEMENT_PROFILE.lock().await = Some(oscquery_profile); // Store one of them for unadvertising
+    } else {
+        return Err("mDNS discovery not initialized.".to_string());
+    }
+    debug!("MDNS server advertisements started.");
+    Ok(())
 }
 
 pub async fn mark_server_stopped() -> Result<(), String> {
     {
-        let mut osc_port_guard = OSC_PORT.lock().await;
-        *osc_port_guard = None;
-    }
-    {
-        let mut oscquery_port_guard = OSCQUERY_PORT.lock().await;
-        *oscquery_port_guard = None;
-    }
-    {
-        let mut service_name_guard = SERVICE_NAME.lock().await;
-        *service_name_guard = None;
-    }
-    {
         let mut server_enabled = SERVER_ENABLED.lock().await;
         *server_enabled = false;
     }
-    reevaluate_sidecar_state().await
+
+    if let Some(discovery) = MDNS_DISCOVERY_INSTANCE.lock().await.as_ref() {
+        if let Some(profile) = SERVER_ADVERTISEMENT_PROFILE.lock().await.take() {
+            // We need to unadvertise both OSC and OSCQuery profiles
+            // Assuming the name and address are the same for both, we derive the OSC one.
+            let osc_profile = OSCQueryServiceProfile::new(
+                profile.name.clone(),
+                profile.address.clone(),
+                0, // Port doesn't matter for unregistering as it identifies by type and name
+                OSCServiceType::OSC,
+            );
+            if let Err(e) = discovery.unadvertise(profile).await {
+                error!("Failed to unadvertise OSCQuery service: {:?}", e);
+            }
+            if let Err(e) = discovery.unadvertise(osc_profile).await {
+                error!("Failed to unadvertise OSC service: {:?}", e);
+            }
+        }
+    }
+    debug!("MDNS server advertisements stopped.");
+    Ok(())
 }
 
 pub async fn mark_client_started() -> Result<(), String> {
@@ -80,181 +264,18 @@ pub async fn mark_client_started() -> Result<(), String> {
         let mut client_enabled = CLIENT_ENABLED.lock().await;
         *client_enabled = true;
     }
-    reevaluate_sidecar_state().await
+    // No direct action needed here, as the monitoring task already handles discovery
+    // We just set the flag.
+    debug!("MDNS client started.");
+    Ok(())
 }
 
 pub async fn mark_client_stopped() -> Result<(), String> {
     {
-        let mut client_enabled: tokio::sync::MutexGuard<'_, bool> = CLIENT_ENABLED.lock().await;
+        let mut client_enabled = CLIENT_ENABLED.lock().await;
         *client_enabled = false;
     }
-    reevaluate_sidecar_state().await
-}
-
-async fn reevaluate_sidecar_state() -> Result<(), String> {
-    let sidecar_running = {
-        let started = SIDECAR_STARTED.lock().await;
-        *started
-    };
-    let server_enabled = {
-        let server_enabled = SERVER_ENABLED.lock().await;
-        *server_enabled
-    };
-    let client_enabled = {
-        let client_enabled = CLIENT_ENABLED.lock().await;
-        *client_enabled
-    };
-    // Stop sidecar if needed
-    if sidecar_running && !server_enabled && !client_enabled {
-        stop_sidecar(false).await;
-        return Ok(());
-    }
-    // Get the ports and service name
-    let osc_port = {
-        let osc_port_guard = OSC_PORT.lock().await;
-        osc_port_guard.clone()
-    };
-    let oscquery_port = {
-        let oscquery_port_guard = OSCQUERY_PORT.lock().await;
-        oscquery_port_guard.clone()
-    };
-    let service_name = {
-        let service_name_guard = SERVICE_NAME.lock().await;
-        service_name_guard.clone()
-    };
-    // (Re)start sidecar
-    start_sidecar(osc_port, oscquery_port, service_name).await
-}
-
-async fn start_sidecar(
-    osc_port: Option<u16>,
-    oscquery_port: Option<u16>,
-    service_name: Option<String>,
-) -> Result<(), String> {
-    {
-        let started = SIDECAR_STARTED.lock().await;
-        if *started {
-            drop(started);
-            stop_sidecar(false).await;
-        }
-    }
-    // Create a channel for killing the sidecar
-    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<()>(1);
-    // Store the kill tx
-    {
-        let mut kill_tx_global = KILL_TX.lock().await;
-        *kill_tx_global = Some(kill_tx);
-    }
-    // Start the sidecar
-    let pid = process::id();
-    let args: Vec<String> =
-        if osc_port.is_some() && oscquery_port.is_some() && service_name.is_some() {
-            vec![
-                pid.to_string(),
-                osc_port.unwrap().to_string(),
-                oscquery_port.unwrap().to_string(),
-                service_name.unwrap().to_string(),
-            ]
-        } else {
-            vec![pid.to_string()]
-        };
-    let sidecar_path = {
-        let guard = EXE_PATH.lock().await;
-        match &*guard {
-            Some(path) => path.clone(),
-            None => {
-                error!("Failed to start sidecar: No executable path set");
-                return Err("NO_EXE_PATH".to_string());
-            }
-        }
-    };
-    let mut cmd = Command::new(sidecar_path);
-    cmd.creation_flags(DETACHED_PROCESS);
-    cmd.args(args);
-    cmd.stdout(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            error!("Failed to start sidecar: Spawn failed: {}", e);
-            return Err("SPAWN_FAILED".to_string());
-        }
-    };
-    // Get its STDOUT
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            error!("Failed to start sidecar: No stdout");
-            return Err("NO_STDOUT".to_string());
-        }
-    };
-    // Keeps the process alive until the sidecar exits
-    tokio::spawn(async move {
-        let status = tokio::select! {
-            _ = kill_rx.recv() => {
-                child.kill().await.unwrap();
-                child.wait().await.unwrap()
-            }
-            status = child.wait() => status.unwrap()
-        };
-        debug!("MDNS sidecar exited: {}", status);
-    });
-    // Read its lines from STDOUT
-    let mut reader = BufReader::new(stdout).lines();
-    tokio::spawn(async move {
-        'line_reader: loop {
-            let line = reader.next_line().await;
-            match line {
-                Ok(line) => {
-                    if let Some(line) = line {
-                        handle_stdout_line(line).await;
-                    } else {
-                        break 'line_reader;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to read line from MDNS sidecar. Forcing MDNS sidecar to quit. Details: {}",
-                        e
-                    );
-                    stop_sidecar(true).await;
-                    break 'line_reader;
-                }
-            }
-        }
-    });
-    {
-        let mut started = SIDECAR_STARTED.lock().await;
-        *started = true;
-    }
-    debug!("Started MDNS sidecar");
+    // No direct action needed, just set the flag.
+    debug!("MDNS client stopped.");
     Ok(())
-}
-
-async fn stop_sidecar(force: bool) {
-    // Only stop if started (unless we force)
-    {
-        let started = SIDECAR_STARTED.lock().await;
-        if !*started && !force {
-            return;
-        }
-    }
-    // Kill the sidecar
-    {
-        let mut kill_tx_guard = KILL_TX.lock().await;
-        if let Some(kill_tx) = &*kill_tx_guard {
-            let _ = kill_tx.send(()).await;
-            // Set the kill tx to None
-            *kill_tx_guard = None;
-        }
-    }
-    // Reset the started flag
-    {
-        let mut started = SIDECAR_STARTED.lock().await;
-        *started = false;
-    }
-    debug!("[OSCQUERY-MDNS] Stopped MDNS sidecar");
-}
-
-async fn handle_stdout_line(line: String) {
-    crate::client::process_log_line(line).await;
 }
