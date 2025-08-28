@@ -1,7 +1,7 @@
 use crate::mdns::{IDiscovery, MeaModDiscovery, OSCQueryServiceProfile, OSCServiceType};
-use crate::{ OSCQueryInitError};
+use crate::OSCQueryInitError;
 use log::{debug, error};
-use std::sync::LazyLock;
+use std::{sync::LazyLock, net::IpAddr};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -26,6 +26,22 @@ static SERVER_ADVERTISEMENT_PROFILE: LazyLock<Mutex<Option<OSCQueryServiceProfil
 
 static CLIENT_ENABLED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static SERVER_ENABLED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+
+async fn get_local_ip_address() -> Option<IpAddr> {
+    // This is a simplified approach. For production, consider iterating over network interfaces
+    // and picking a suitable non-loopback, non-link-local IPv4 address.
+    // For many local networks, this will work.
+    match local_ip_address::local_ip() {
+        Ok(ip) => {
+            debug!("Detected local IP for advertising: {}", ip);
+            Some(ip)
+        },
+        Err(e) => {
+            error!("Error determining local IP address: {:?}", e);
+            None
+        }
+    }
+}
 
 pub async fn init_client_channels(
 ) -> Result<(Receiver<(String, u16)>, Receiver<(String, u16)>), OSCQueryInitError> {
@@ -194,17 +210,20 @@ pub async fn mark_server_started(
             }
         }
     }
+    let local_ip = get_local_ip_address().await.ok_or_else(|| {
+            "Failed to determine local IP address for mDNS advertisement".to_string()
+        })?;
 
     // Store the server advertisement profile
     let osc_profile = OSCQueryServiceProfile::new(
         service_name.clone(),
-        "127.0.0.1".parse().unwrap(), // Or actual local IP if needed
+        local_ip,
         osc_port,
         OSCServiceType::OSC,
     );
     let oscquery_profile = OSCQueryServiceProfile::new(
         service_name.clone(),
-        "127.0.0.1".parse().unwrap(), // Or actual local IP if needed
+        local_ip,
         oscquery_port,
         OSCServiceType::OSCQuery,
     );
