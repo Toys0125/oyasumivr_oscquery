@@ -56,11 +56,12 @@ impl OSCQueryServiceProfile {
 
     pub fn to_service_info(&self) -> ServiceInfo {
         let service_type_str = self.service_type.get_service_type_string();
-        let properties = [("local", "local")];
+        let host_name = format!("{}.osc.local.", self.name);
+        let properties = [("txtvers", "1")];
         ServiceInfo::new(
             service_type_str,
             &self.name,
-            &self.address.to_string(),
+            &host_name,
             &self.address,
             self.port,
             &properties[..],
